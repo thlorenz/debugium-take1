@@ -2,17 +2,33 @@
 
 Attempt at pulling out chromium debugger to use it with Node.js.
 
+## Getting Started
+
+After cloning run `./scripts/init` in order to initialize the repo.
+
+## Building
+
+Execute gyp to regenerate build files, then run ninja.
+
+```sh
+./scripts/gyp
+ninja -C src/out/Debug all
+```
+
 ## Sources
 
 ```
-./src                                 https://chromium.googlesource.com/chromium/src
+./src                                 https://chromium.googlesource.com/chromium/src        (copied for now)
       /build                          https://chromium.googlesource.com/chromium/src/build
+      /content/public/browser         part of /src repo
       /third_party
       |           /WebKit             https://chromium.googlesource.com/chromium/blink
       |
       /tools
             /grit                     https://chromium.googlesource.com/external/grit-i18n.git
             /gyp                      https://chromium.googlesource.com/external/gyp.git
+            /clang                    https://chromium.googlesource.com/chromium/src/tools/clang
+            /gritsettings             part of /src repo
 ```
 
 ## Dependencies

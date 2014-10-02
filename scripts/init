@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+
+DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+
+ROOT=$DIR/../
+SRC=$ROOT/src/
+
+#
+# Build directory structure and clone submodules.
+# These may be included as proper git submodules later on.
+#
+
+# build
+git clone --depth 10 https://chromium.googlesource.com/chromium/src/build $SRC/build
+
+# blink
+mkdir -p $SRC/third_party
+git clone --depth 10 https://chromium.googlesource.com/chromium/blink $SRC/third_party/WebKit
+
+# tools (some are included with src repo, others come from separate repos)
+mkdir -p $SRC/tools
+git clone --depth 10 https://chromium.googlesource.com/external/grit-i18n.git    $SRC/tools/grit
+git clone --depth 10 https://chromium.googlesource.com/external/gyp.git          $SRC/tools/gyp
+git clone --depth 10 https://chromium.googlesource.com/chromium/src/tools/clang  $SRC/tools/clang
+
+# copy the gyp_debugium script into the build dir in order to run it from there to make python imports work
+rm -f $SRC/build/gyp_debugium
+cp $SRC/build_debugium/gyp_debugium $SRC/build/gyp_debugium
