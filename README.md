@@ -36,9 +36,9 @@ ninja -C src/out/Debug all
 ### Main Target
 
 ```
-./src/chrome/debugium_resources.gyp
-  :debugium_extra_resources
-    - ./src/content/browser/devtools/devtools_resources.gyp:devtools_resources
+./src/build_debugium/debugium.gyp
+  - ./src/content/browser/devtools/devtools_resources.gyp:devtools_resources
+  - ./src/content/browser/devtools/devtools.gyp:devtools_protocol_handler
 ```
 
 ### Resource/Code Generators
@@ -51,6 +51,8 @@ ninja -C src/out/Debug all
 #### Targets
 
 ##### devtools resources
+
+- `devtools.gyp:devtools_resources` uses part of same dependencies and adds no others
 
 ```
 ./src/content/browser/devtools/devtools_resources.gyp
