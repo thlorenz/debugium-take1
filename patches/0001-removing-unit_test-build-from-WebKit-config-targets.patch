@@ -1,0 +1,62 @@
+From ca188061b10b9e75ea3dfbc41e00b0728a23a000 Mon Sep 17 00:00:00 2001
+From: Thorsten Lorenz <thlorenz@gmx.de>
+Date: Fri, 3 Oct 2014 22:59:57 -0400
+Subject: [PATCH] removing unit_test build from WebKit config targets
+
+---
+ Source/config.gyp | 40 ++++++++++++++++++++--------------------
+ 1 file changed, 20 insertions(+), 20 deletions(-)
+
+diff --git a/Source/config.gyp b/Source/config.gyp
+index 05b671d..426765c 100644
+--- a/Source/config.gyp
++++ b/Source/config.gyp
+@@ -115,25 +115,25 @@
+       ],
+     },
+   },
+-  {
+-    'target_name': 'unittest_config',
+-    'type': 'none',
+-    'dependencies': [
+-      'config',
+-      '<(DEPTH)/testing/gmock.gyp:gmock',
+-      '<(DEPTH)/testing/gtest.gyp:gtest',
+-    ],
+-    'export_dependent_settings': [
+-      'config',
+-      '<(DEPTH)/testing/gmock.gyp:gmock',
+-      '<(DEPTH)/testing/gtest.gyp:gtest',
+-    ],
+-    'direct_dependent_settings': {
+-      'variables': {
+-        'chromium_code': 1,
+-        'clang_warning_flags_unset': [ '-Wglobal-constructors' ],
+-      },
+-    },
+-  }
++  #{
++    #'target_name': 'unittest_config',
++    #'type': 'none',
++    #'dependencies': [
++      #'config',
++      #'<(DEPTH)/testing/gmock.gyp:gmock',
++      #'<(DEPTH)/testing/gtest.gyp:gtest',
++    #],
++    #'export_dependent_settings': [
++      #'config',
++      #'<(DEPTH)/testing/gmock.gyp:gmock',
++      #'<(DEPTH)/testing/gtest.gyp:gtest',
++    #],
++    #'direct_dependent_settings': {
++      #'variables': {
++        #'chromium_code': 1,
++        #'clang_warning_flags_unset': [ '-Wglobal-constructors' ],
++      #},
++    #},
++  #}
+   ],
+ }
+-- 
+1.9.3 (Apple Git-50)
+

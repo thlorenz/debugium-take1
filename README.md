@@ -6,6 +6,10 @@ Attempt at pulling out chromium debugger to use it with Node.js.
 
 After cloning run `./scripts/init` in order to initialize the repo.
 
+## Add Paths
+
+Run `source ./scripts/exports` to add necessary paths, i.e. to use custom installed **clang** to build debugium.
+
 ## Building
 
 Execute gyp to regenerate build files, then run ninja.
@@ -22,8 +26,9 @@ ninja -C src/out/Debug all
       /build                          https://chromium.googlesource.com/chromium/src/build
       /content/public/browser         part of /src repo
       /third_party
-      |           /WebKit             https://chromium.googlesource.com/chromium/blink
-      |
+                  /WebKit             https://chromium.googlesource.com/chromium/blink
+                  /icu                https://chromium.googlesource.com/chromium/deps/icu52 
+                  /llvm-build         generated via ./tools/clang/update.sh
       /tools
             /grit                     https://chromium.googlesource.com/external/grit-i18n.git
             /gyp                      https://chromium.googlesource.com/external/gyp.git
@@ -62,15 +67,14 @@ ninja -C src/out/Debug all
       - ./src/tools/grit/grit.py
     @devtools_protocol_constants
       - ./src/third_party/WebKit/Source/devtools/protocol.json
+      - ./src/content/browser/devtools/browser_protocol.json
       - ./src/third_party/WebKit/public/browser/devtools_protocol_constants_generator.py
 
 ./src/third_party/WebKit/public/blink_devtools.gyp
   :blink_generate_devtools_grd
     - ./src/third_party/WebKit/Source/devtools/devtools.gyp:generate_devtools_grd
-  :devtools_protocol_constants
-    - ./src/third_party/WebKit/Source/devtools/protocol.json
-    - ./src/content/browser/devtools/browser_protocol.json
-    - ./src/content/public/browser/devtools_protocol_constants_generator.py
+  :blink_devtools_frontend_resources
+    - ./src/third_party/WebKit/Source/devtools/devtools.gyp:devtools_frontend_resources
 
 ./src/third_party/WebKit/public/blink_devtools.gyp
   :blink_generate_devtools_grd

@@ -17,12 +17,23 @@ git clone --depth 10 https://chromium.googlesource.com/chromium/src/build $SRC/b
 mkdir -p $SRC/third_party
 git clone --depth 10 https://chromium.googlesource.com/chromium/blink $SRC/third_party/WebKit
 
+# third_party other than blink
+git clone --depth 10 https://chromium.googlesource.com/chromium/deps/icu52 $SRC/third_party/WebKit
+
 # tools (some are included with src repo, others come from separate repos)
 mkdir -p $SRC/tools
 git clone --depth 10 https://chromium.googlesource.com/external/grit-i18n.git    $SRC/tools/grit
 git clone --depth 10 https://chromium.googlesource.com/external/gyp.git          $SRC/tools/gyp
 git clone --depth 10 https://chromium.googlesource.com/chromium/src/tools/clang  $SRC/tools/clang
 
+# install ./src/third_party/llvm-build
+./src/tools/clang/scripts/update.sh
+
 # copy the gyp_debugium script into the build dir in order to run it from there to make python imports work
 rm -f $SRC/build/gyp_debugium
 cp $SRC/build_debugium/gyp_debugium $SRC/build/gyp_debugium
+
+
+## PATCHES
+### WebKit
+(cd $SRC/third_party/WebKit/ && git apply $ROOT/patches/0001-removing-unit_test-build-from-WebKit-config-targets.patch)
