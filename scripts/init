@@ -18,7 +18,7 @@ mkdir -p $SRC/third_party
 git clone --depth 10 https://chromium.googlesource.com/chromium/blink $SRC/third_party/WebKit
 
 # third_party other than blink
-git clone --depth 10 https://chromium.googlesource.com/chromium/deps/icu52 $SRC/third_party/WebKit
+git clone --depth 10 https://chromium.googlesource.com/chromium/deps/icu52 $SRC/third_party/icu
 
 # tools (some are included with src repo, others come from separate repos)
 mkdir -p $SRC/tools
@@ -36,4 +36,7 @@ cp $SRC/build_debugium/gyp_debugium $SRC/build/gyp_debugium
 
 ## PATCHES
 ### WebKit
-(cd $SRC/third_party/WebKit/ && git apply $ROOT/patches/0001-removing-unit_test-build-from-WebKit-config-targets.patch)
+(cd $SRC/third_party/WebKit/                                                                 \
+  && git apply $ROOT/patches/0001-removing-unit_test-build-from-WebKit-config-targets.patch  \
+  && git apply $ROOT/patches/0002-disabling-all-targets-but-inspector_protocol_resourc.patch \
+)

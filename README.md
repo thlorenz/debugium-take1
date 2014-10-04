@@ -2,15 +2,39 @@
 
 Attempt at pulling out chromium debugger to use it with Node.js.
 
+<!-- START doctoc generated TOC please keep comment here to allow auto update -->
+<!-- DON'T EDIT THIS SECTION, INSTEAD RE-RUN doctoc TO UPDATE -->
+**Table of Contents**  *generated with [DocToc](http://doctoc.herokuapp.com/)*
+
+- [Getting Started](#getting-started)
+  - [Init Repo](#init-repo)
+  - [Add Paths](#add-paths)
+  - [Building](#building)
+- [Sources](#sources)
+- [Dependencies](#dependencies)
+  - [Main Target](#main-target)
+  - [Resource/Code Generators](#resourcecode-generators)
+    - [Most need](#most-need)
+    - [Targets](#targets)
+      - [devtools resources](#devtools-resources)
+- [License](#license)
+
+<!-- END doctoc generated TOC please keep comment here to allow auto update -->
+
+
 ## Getting Started
+
+Since we are not using `gclient` a few scripts have been included in order to properly set up the `debugium` repository.
+
+### Init Repo
 
 After cloning run `./scripts/init` in order to initialize the repo.
 
-## Add Paths
+### Add Paths
 
 Run `source ./scripts/exports` to add necessary paths, i.e. to use custom installed **clang** to build debugium.
 
-## Building
+### Building
 
 Execute gyp to regenerate build files, then run ninja.
 
@@ -29,6 +53,8 @@ ninja -C src/out/Debug all
                   /WebKit             https://chromium.googlesource.com/chromium/blink
                   /icu                https://chromium.googlesource.com/chromium/deps/icu52 
                   /llvm-build         generated via ./tools/clang/update.sh
+                  /jinja2             part of /src repo (original: https://github.com/mitsuhiko/jinja2)
+                  /markupsafe         part of /src repo (original: https://github.com/mitsuhiko/markupsafe)
       /tools
             /grit                     https://chromium.googlesource.com/external/grit-i18n.git
             /gyp                      https://chromium.googlesource.com/external/gyp.git
