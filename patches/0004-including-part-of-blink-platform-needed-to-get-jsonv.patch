@@ -1,0 +1,2268 @@
+From 015b3e1b3b0bf97fb0c9f5062c2103fafc6b5872 Mon Sep 17 00:00:00 2001
+From: Thorsten Lorenz <thlorenz@gmx.de>
+Date: Mon, 6 Oct 2014 13:25:11 -0400
+Subject: [PATCH] including part of blink platform needed to get jsonvalues
+
+---
+ Source/platform/Decimal.cpp         | 1026 +++++++++++++++++++++++++++++++++++
+ Source/platform/Decimal.h           |  182 +++++++
+ Source/platform/JSONValues.cpp      |  529 ++++++++++++++++++
+ Source/platform/JSONValues.h        |  319 +++++++++++
+ Source/platform/PlatformExport.h    |   66 +++
+ Source/platform/blink_platform.gyp  |   69 +++
+ Source/platform/blink_platform.gypi |   10 +
+ 7 files changed, 2201 insertions(+)
+ create mode 100644 Source/platform/Decimal.cpp
+ create mode 100644 Source/platform/Decimal.h
+ create mode 100644 Source/platform/JSONValues.cpp
+ create mode 100644 Source/platform/JSONValues.h
+ create mode 100644 Source/platform/PlatformExport.h
+ create mode 100644 Source/platform/blink_platform.gyp
+ create mode 100644 Source/platform/blink_platform.gypi
+
+diff --git a/Source/platform/Decimal.cpp b/Source/platform/Decimal.cpp
+new file mode 100644
+index 0000000..9324409
+--- /dev/null
++++ b/Source/platform/Decimal.cpp
+@@ -0,0 +1,1026 @@
++/*
++ * Copyright (C) 2012 Google Inc. All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions are
++ * met:
++ *
++ *     * Redistributions of source code must retain the above copyright
++ * notice, this list of conditions and the following disclaimer.
++ *     * Redistributions in binary form must reproduce the above
++ * copyright notice, this list of conditions and the following disclaimer
++ * in the documentation and/or other materials provided with the
++ * distribution.
++ *     * Neither the name of Google Inc. nor the names of its
++ * contributors may be used to endorse or promote products derived from
++ * this software without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++ * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++ * OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++ * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ */
++
++#include "config.h"
++#include "platform/Decimal.h"
++
++#include "wtf/MathExtras.h"
++#include "wtf/Noncopyable.h"
++#include "wtf/text/StringBuilder.h"
++
++#include <algorithm>
++#include <float.h>
++
++namespace blink {
++
++namespace DecimalPrivate {
++
++static int const ExponentMax = 1023;
++static int const ExponentMin = -1023;
++static int const Precision = 18;
++
++static const uint64_t MaxCoefficient = UINT64_C(0xDE0B6B3A763FFFF); // 999999999999999999 == 18 9's
++
++// This class handles Decimal special values.
++class SpecialValueHandler {
++    WTF_MAKE_NONCOPYABLE(SpecialValueHandler);
++public:
++    enum HandleResult {
++        BothFinite,
++        BothInfinity,
++        EitherNaN,
++        LHSIsInfinity,
++        RHSIsInfinity,
++    };
++
++    SpecialValueHandler(const Decimal& lhs, const Decimal& rhs);
++    HandleResult handle();
++    Decimal value() const;
++
++private:
++    enum Result {
++        ResultIsLHS,
++        ResultIsRHS,
++        ResultIsUnknown,
++    };
++
++    const Decimal& m_lhs;
++    const Decimal& m_rhs;
++    Result m_result;
++};
++
++SpecialValueHandler::SpecialValueHandler(const Decimal& lhs, const Decimal& rhs)
++    : m_lhs(lhs), m_rhs(rhs), m_result(ResultIsUnknown)
++{
++}
++
++SpecialValueHandler::HandleResult SpecialValueHandler::handle()
++{
++    if (m_lhs.isFinite() && m_rhs.isFinite())
++        return BothFinite;
++
++    const Decimal::EncodedData::FormatClass lhsClass = m_lhs.value().formatClass();
++    const Decimal::EncodedData::FormatClass rhsClass = m_rhs.value().formatClass();
++    if (lhsClass == Decimal::EncodedData::ClassNaN) {
++        m_result = ResultIsLHS;
++        return EitherNaN;
++    }
++
++    if (rhsClass == Decimal::EncodedData::ClassNaN) {
++        m_result = ResultIsRHS;
++        return EitherNaN;
++    }
++
++    if (lhsClass == Decimal::EncodedData::ClassInfinity)
++        return rhsClass == Decimal::EncodedData::ClassInfinity ? BothInfinity : LHSIsInfinity;
++
++    if (rhsClass == Decimal::EncodedData::ClassInfinity)
++        return RHSIsInfinity;
++
++    ASSERT_NOT_REACHED();
++    return BothFinite;
++}
++
++Decimal SpecialValueHandler::value() const
++{
++    switch (m_result) {
++    case ResultIsLHS:
++        return m_lhs;
++    case ResultIsRHS:
++        return m_rhs;
++    case ResultIsUnknown:
++    default:
++        ASSERT_NOT_REACHED();
++        return m_lhs;
++    }
++}
++
++// This class is used for 128 bit unsigned integer arithmetic.
++class UInt128 {
++public:
++    UInt128(uint64_t low, uint64_t high)
++        : m_high(high), m_low(low)
++    {
++    }
++
++    UInt128& operator/=(uint32_t);
++
++    uint64_t high() const { return m_high; }
++    uint64_t low() const { return m_low; }
++
++    static UInt128 multiply(uint64_t u, uint64_t v) { return UInt128(u * v, multiplyHigh(u, v)); }
++
++private:
++    static uint32_t highUInt32(uint64_t x) { return static_cast<uint32_t>(x >> 32); }
++    static uint32_t lowUInt32(uint64_t x) { return static_cast<uint32_t>(x & ((static_cast<uint64_t>(1) << 32) - 1)); }
++    static uint64_t makeUInt64(uint32_t low, uint32_t high) { return low | (static_cast<uint64_t>(high) << 32); }
++
++    static uint64_t multiplyHigh(uint64_t, uint64_t);
++
++    uint64_t m_high;
++    uint64_t m_low;
++};
++
++UInt128& UInt128::operator/=(const uint32_t divisor)
++{
++    ASSERT(divisor);
++
++    if (!m_high) {
++        m_low /= divisor;
++        return *this;
++    }
++
++    uint32_t dividend[4];
++    dividend[0] = lowUInt32(m_low);
++    dividend[1] = highUInt32(m_low);
++    dividend[2] = lowUInt32(m_high);
++    dividend[3] = highUInt32(m_high);
++
++    uint32_t quotient[4];
++    uint32_t remainder = 0;
++    for (int i = 3; i >= 0; --i) {
++        const uint64_t work = makeUInt64(dividend[i], remainder);
++        remainder = static_cast<uint32_t>(work % divisor);
++        quotient[i] = static_cast<uint32_t>(work / divisor);
++    }
++    m_low = makeUInt64(quotient[0], quotient[1]);
++    m_high = makeUInt64(quotient[2], quotient[3]);
++    return *this;
++}
++
++// Returns high 64bit of 128bit product.
++uint64_t UInt128::multiplyHigh(uint64_t u, uint64_t v)
++{
++    const uint64_t uLow = lowUInt32(u);
++    const uint64_t uHigh = highUInt32(u);
++    const uint64_t vLow = lowUInt32(v);
++    const uint64_t vHigh = highUInt32(v);
++    const uint64_t partialProduct = uHigh * vLow + highUInt32(uLow * vLow);
++    return uHigh * vHigh + highUInt32(partialProduct) + highUInt32(uLow * vHigh + lowUInt32(partialProduct));
++}
++
++static int countDigits(uint64_t x)
++{
++    int numberOfDigits = 0;
++    for (uint64_t powerOfTen = 1; x >= powerOfTen; powerOfTen *= 10) {
++        ++numberOfDigits;
++        if (powerOfTen >= std::numeric_limits<uint64_t>::max() / 10)
++            break;
++    }
++    return numberOfDigits;
++}
++
++static uint64_t scaleDown(uint64_t x, int n)
++{
++    ASSERT(n >= 0);
++    while (n > 0 && x) {
++        x /= 10;
++        --n;
++    }
++    return x;
++}
++
++static uint64_t scaleUp(uint64_t x, int n)
++{
++    ASSERT(n >= 0);
++    ASSERT(n < Precision);
++
++    uint64_t y = 1;
++    uint64_t z = 10;
++    for (;;) {
++        if (n & 1)
++            y = y * z;
++
++        n >>= 1;
++        if (!n)
++            return x * y;
++
++        z = z * z;
++    }
++}
++
++} // namespace DecimalPrivate
++
++using namespace DecimalPrivate;
++
++Decimal::EncodedData::EncodedData(Sign sign, FormatClass formatClass)
++    : m_coefficient(0)
++    , m_exponent(0)
++    , m_formatClass(formatClass)
++    , m_sign(sign)
++{
++}
++
++Decimal::EncodedData::EncodedData(Sign sign, int exponent, uint64_t coefficient)
++    : m_formatClass(coefficient ? ClassNormal : ClassZero)
++    , m_sign(sign)
++{
++    if (exponent >= ExponentMin && exponent <= ExponentMax) {
++        while (coefficient > MaxCoefficient) {
++            coefficient /= 10;
++            ++exponent;
++        }
++    }
++
++    if (exponent > ExponentMax) {
++        m_coefficient = 0;
++        m_exponent = 0;
++        m_formatClass = ClassInfinity;
++        return;
++    }
++
++    if (exponent < ExponentMin) {
++        m_coefficient = 0;
++        m_exponent = 0;
++        m_formatClass = ClassZero;
++        return;
++    }
++
++    m_coefficient = coefficient;
++    m_exponent = static_cast<int16_t>(exponent);
++}
++
++bool Decimal::EncodedData::operator==(const EncodedData& another) const
++{
++    return m_sign == another.m_sign
++        && m_formatClass == another.m_formatClass
++        && m_exponent == another.m_exponent
++        && m_coefficient == another.m_coefficient;
++}
++
++Decimal::Decimal(int32_t i32)
++    : m_data(i32 < 0 ? Negative : Positive, 0, i32 < 0 ? static_cast<uint64_t>(-static_cast<int64_t>(i32)) : static_cast<uint64_t>(i32))
++{
++}
++
++Decimal::Decimal(Sign sign, int exponent, uint64_t coefficient)
++    : m_data(sign, exponent, coefficient)
++{
++}
++
++Decimal::Decimal(const EncodedData& data)
++    : m_data(data)
++{
++}
++
++Decimal::Decimal(const Decimal& other)
++    : m_data(other.m_data)
++{
++}
++
++Decimal& Decimal::operator=(const Decimal& other)
++{
++    m_data = other.m_data;
++    return *this;
++}
++
++Decimal& Decimal::operator+=(const Decimal& other)
++{
++    m_data = (*this + other).m_data;
++    return *this;
++}
++
++Decimal& Decimal::operator-=(const Decimal& other)
++{
++    m_data = (*this - other).m_data;
++    return *this;
++}
++
++Decimal& Decimal::operator*=(const Decimal& other)
++{
++    m_data = (*this * other).m_data;
++    return *this;
++}
++
++Decimal& Decimal::operator/=(const Decimal& other)
++{
++    m_data = (*this / other).m_data;
++    return *this;
++}
++
++Decimal Decimal::operator-() const
++{
++    if (isNaN())
++        return *this;
++
++    Decimal result(*this);
++    result.m_data.setSign(invertSign(m_data.sign()));
++    return result;
++}
++
++Decimal Decimal::operator+(const Decimal& rhs) const
++{
++    const Decimal& lhs = *this;
++    const Sign lhsSign = lhs.sign();
++    const Sign rhsSign = rhs.sign();
++
++    SpecialValueHandler handler(lhs, rhs);
++    switch (handler.handle()) {
++    case SpecialValueHandler::BothFinite:
++        break;
++
++    case SpecialValueHandler::BothInfinity:
++        return lhsSign == rhsSign ? lhs : nan();
++
++    case SpecialValueHandler::EitherNaN:
++        return handler.value();
++
++    case SpecialValueHandler::LHSIsInfinity:
++        return lhs;
++
++    case SpecialValueHandler::RHSIsInfinity:
++        return rhs;
++    }
++
++    const AlignedOperands alignedOperands = alignOperands(lhs, rhs);
++
++    const uint64_t result = lhsSign == rhsSign
++        ? alignedOperands.lhsCoefficient + alignedOperands.rhsCoefficient
++        : alignedOperands.lhsCoefficient - alignedOperands.rhsCoefficient;
++
++    if (lhsSign == Negative && rhsSign == Positive && !result)
++        return Decimal(Positive, alignedOperands.exponent, 0);
++
++    return static_cast<int64_t>(result) >= 0
++        ? Decimal(lhsSign, alignedOperands.exponent, result)
++        : Decimal(invertSign(lhsSign), alignedOperands.exponent, -static_cast<int64_t>(result));
++}
++
++Decimal Decimal::operator-(const Decimal& rhs) const
++{
++    const Decimal& lhs = *this;
++    const Sign lhsSign = lhs.sign();
++    const Sign rhsSign = rhs.sign();
++
++    SpecialValueHandler handler(lhs, rhs);
++    switch (handler.handle()) {
++    case SpecialValueHandler::BothFinite:
++        break;
++
++    case SpecialValueHandler::BothInfinity:
++        return lhsSign == rhsSign ? nan() : lhs;
++
++    case SpecialValueHandler::EitherNaN:
++        return handler.value();
++
++    case SpecialValueHandler::LHSIsInfinity:
++        return lhs;
++
++    case SpecialValueHandler::RHSIsInfinity:
++        return infinity(invertSign(rhsSign));
++    }
++
++    const AlignedOperands alignedOperands = alignOperands(lhs, rhs);
++
++    const uint64_t result = lhsSign == rhsSign
++        ? alignedOperands.lhsCoefficient - alignedOperands.rhsCoefficient
++        : alignedOperands.lhsCoefficient + alignedOperands.rhsCoefficient;
++
++    if (lhsSign == Negative && rhsSign == Negative && !result)
++        return Decimal(Positive, alignedOperands.exponent, 0);
++
++    return static_cast<int64_t>(result) >= 0
++        ? Decimal(lhsSign, alignedOperands.exponent, result)
++        : Decimal(invertSign(lhsSign), alignedOperands.exponent, -static_cast<int64_t>(result));
++}
++
++Decimal Decimal::operator*(const Decimal& rhs) const
++{
++    const Decimal& lhs = *this;
++    const Sign lhsSign = lhs.sign();
++    const Sign rhsSign = rhs.sign();
++    const Sign resultSign = lhsSign == rhsSign ? Positive : Negative;
++
++    SpecialValueHandler handler(lhs, rhs);
++    switch (handler.handle()) {
++    case SpecialValueHandler::BothFinite: {
++        const uint64_t lhsCoefficient = lhs.m_data.coefficient();
++        const uint64_t rhsCoefficient = rhs.m_data.coefficient();
++        int resultExponent = lhs.exponent() + rhs.exponent();
++        UInt128 work(UInt128::multiply(lhsCoefficient, rhsCoefficient));
++        while (work.high()) {
++            work /= 10;
++            ++resultExponent;
++        }
++        return Decimal(resultSign, resultExponent, work.low());
++    }
++
++    case SpecialValueHandler::BothInfinity:
++        return infinity(resultSign);
++
++    case SpecialValueHandler::EitherNaN:
++        return handler.value();
++
++    case SpecialValueHandler::LHSIsInfinity:
++        return rhs.isZero() ? nan() : infinity(resultSign);
++
++    case SpecialValueHandler::RHSIsInfinity:
++        return lhs.isZero() ? nan() : infinity(resultSign);
++    }
++
++    ASSERT_NOT_REACHED();
++    return nan();
++}
++
++Decimal Decimal::operator/(const Decimal& rhs) const
++{
++    const Decimal& lhs = *this;
++    const Sign lhsSign = lhs.sign();
++    const Sign rhsSign = rhs.sign();
++    const Sign resultSign = lhsSign == rhsSign ? Positive : Negative;
++
++    SpecialValueHandler handler(lhs, rhs);
++    switch (handler.handle()) {
++    case SpecialValueHandler::BothFinite:
++        break;
++
++    case SpecialValueHandler::BothInfinity:
++        return nan();
++
++    case SpecialValueHandler::EitherNaN:
++        return handler.value();
++
++    case SpecialValueHandler::LHSIsInfinity:
++        return infinity(resultSign);
++
++    case SpecialValueHandler::RHSIsInfinity:
++        return zero(resultSign);
++    }
++
++    ASSERT(lhs.isFinite());
++    ASSERT(rhs.isFinite());
++
++    if (rhs.isZero())
++        return lhs.isZero() ? nan() : infinity(resultSign);
++
++    int resultExponent = lhs.exponent() - rhs.exponent();
++
++    if (lhs.isZero())
++        return Decimal(resultSign, resultExponent, 0);
++
++    uint64_t remainder = lhs.m_data.coefficient();
++    const uint64_t divisor = rhs.m_data.coefficient();
++    uint64_t result = 0;
++    while (result < MaxCoefficient / 100) {
++        while (remainder < divisor) {
++            remainder *= 10;
++            result *= 10;
++            --resultExponent;
++        }
++        result += remainder / divisor;
++        remainder %= divisor;
++        if (!remainder)
++            break;
++    }
++
++    if (remainder > divisor / 2)
++        ++result;
++
++    return Decimal(resultSign, resultExponent, result);
++}
++
++bool Decimal::operator==(const Decimal& rhs) const
++{
++    return m_data == rhs.m_data || compareTo(rhs).isZero();
++}
++
++bool Decimal::operator!=(const Decimal& rhs) const
++{
++    if (m_data == rhs.m_data)
++        return false;
++    const Decimal result = compareTo(rhs);
++    if (result.isNaN())
++        return false;
++    return !result.isZero();
++}
++
++bool Decimal::operator<(const Decimal& rhs) const
++{
++    const Decimal result = compareTo(rhs);
++    if (result.isNaN())
++        return false;
++    return !result.isZero() && result.isNegative();
++}
++
++bool Decimal::operator<=(const Decimal& rhs) const
++{
++    if (m_data == rhs.m_data)
++        return true;
++    const Decimal result = compareTo(rhs);
++    if (result.isNaN())
++        return false;
++    return result.isZero() || result.isNegative();
++}
++
++bool Decimal::operator>(const Decimal& rhs) const
++{
++    const Decimal result = compareTo(rhs);
++    if (result.isNaN())
++        return false;
++    return !result.isZero() && result.isPositive();
++}
++
++bool Decimal::operator>=(const Decimal& rhs) const
++{
++    if (m_data == rhs.m_data)
++        return true;
++    const Decimal result = compareTo(rhs);
++    if (result.isNaN())
++        return false;
++    return result.isZero() || !result.isNegative();
++}
++
++Decimal Decimal::abs() const
++{
++    Decimal result(*this);
++    result.m_data.setSign(Positive);
++    return result;
++}
++
++Decimal::AlignedOperands Decimal::alignOperands(const Decimal& lhs, const Decimal& rhs)
++{
++    ASSERT(lhs.isFinite());
++    ASSERT(rhs.isFinite());
++
++    const int lhsExponent = lhs.exponent();
++    const int rhsExponent = rhs.exponent();
++    int exponent = std::min(lhsExponent, rhsExponent);
++    uint64_t lhsCoefficient = lhs.m_data.coefficient();
++    uint64_t rhsCoefficient = rhs.m_data.coefficient();
++
++    if (lhsExponent > rhsExponent) {
++        const int numberOfLHSDigits = countDigits(lhsCoefficient);
++        if (numberOfLHSDigits) {
++            const int lhsShiftAmount = lhsExponent - rhsExponent;
++            const int overflow = numberOfLHSDigits + lhsShiftAmount - Precision;
++            if (overflow <= 0) {
++                lhsCoefficient = scaleUp(lhsCoefficient, lhsShiftAmount);
++            } else {
++                lhsCoefficient = scaleUp(lhsCoefficient, lhsShiftAmount - overflow);
++                rhsCoefficient = scaleDown(rhsCoefficient, overflow);
++                exponent += overflow;
++            }
++        }
++
++    } else if (lhsExponent < rhsExponent) {
++        const int numberOfRHSDigits = countDigits(rhsCoefficient);
++        if (numberOfRHSDigits) {
++            const int rhsShiftAmount = rhsExponent - lhsExponent;
++            const int overflow = numberOfRHSDigits + rhsShiftAmount - Precision;
++            if (overflow <= 0) {
++                rhsCoefficient = scaleUp(rhsCoefficient, rhsShiftAmount);
++            } else {
++                rhsCoefficient = scaleUp(rhsCoefficient, rhsShiftAmount - overflow);
++                lhsCoefficient = scaleDown(lhsCoefficient, overflow);
++                exponent += overflow;
++            }
++        }
++    }
++
++    AlignedOperands alignedOperands;
++    alignedOperands.exponent = exponent;
++    alignedOperands.lhsCoefficient = lhsCoefficient;
++    alignedOperands.rhsCoefficient = rhsCoefficient;
++    return alignedOperands;
++}
++
++static bool isMultiplePowersOfTen(uint64_t coefficient, int n)
++{
++    return !coefficient || !(coefficient % scaleUp(1, n));
++}
++
++// Round toward positive infinity.
++// Note: Mac ports defines ceil(x) as wtf_ceil(x), so we can't use name "ceil" here.
++Decimal Decimal::ceiling() const
++{
++    if (isSpecial())
++        return *this;
++
++    if (exponent() >= 0)
++        return *this;
++
++    uint64_t result = m_data.coefficient();
++    const int numberOfDigits = countDigits(result);
++    const int numberOfDropDigits = -exponent();
++    if (numberOfDigits < numberOfDropDigits)
++        return isPositive() ? Decimal(1) : zero(Positive);
++
++    result = scaleDown(result, numberOfDropDigits);
++    if (isPositive() && !isMultiplePowersOfTen(m_data.coefficient(), numberOfDropDigits))
++        ++result;
++    return Decimal(sign(), 0, result);
++}
++
++Decimal Decimal::compareTo(const Decimal& rhs) const
++{
++    const Decimal result(*this - rhs);
++    switch (result.m_data.formatClass()) {
++    case EncodedData::ClassInfinity:
++        return result.isNegative() ? Decimal(-1) : Decimal(1);
++
++    case EncodedData::ClassNaN:
++    case EncodedData::ClassNormal:
++        return result;
++
++    case EncodedData::ClassZero:
++        return zero(Positive);
++
++    default:
++        ASSERT_NOT_REACHED();
++        return nan();
++    }
++}
++
++// Round toward negative infinity.
++Decimal Decimal::floor() const
++{
++    if (isSpecial())
++        return *this;
++
++    if (exponent() >= 0)
++        return *this;
++
++    uint64_t result = m_data.coefficient();
++    const int numberOfDigits = countDigits(result);
++    const int numberOfDropDigits = -exponent();
++    if (numberOfDigits < numberOfDropDigits)
++        return isPositive() ? zero(Positive) : Decimal(-1);
++
++    result = scaleDown(result, numberOfDropDigits);
++    if (isNegative() && !isMultiplePowersOfTen(m_data.coefficient(), numberOfDropDigits))
++        ++result;
++    return Decimal(sign(), 0, result);
++}
++
++Decimal Decimal::fromDouble(double doubleValue)
++{
++    if (std::isfinite(doubleValue))
++        return fromString(String::numberToStringECMAScript(doubleValue));
++
++    if (std::isinf(doubleValue))
++        return infinity(doubleValue < 0 ? Negative : Positive);
++
++    return nan();
++}
++
++Decimal Decimal::fromString(const String& str)
++{
++    int exponent = 0;
++    Sign exponentSign = Positive;
++    int numberOfDigits = 0;
++    int numberOfDigitsAfterDot = 0;
++    int numberOfExtraDigits = 0;
++    Sign sign = Positive;
++
++    enum {
++        StateDigit,
++        StateDot,
++        StateDotDigit,
++        StateE,
++        StateEDigit,
++        StateESign,
++        StateSign,
++        StateStart,
++        StateZero,
++    } state = StateStart;
++
++#define HandleCharAndBreak(expected, nextState) \
++    if (ch == expected) { \
++        state = nextState; \
++        break; \
++    }
++
++#define HandleTwoCharsAndBreak(expected1, expected2, nextState) \
++    if (ch == expected1 || ch == expected2) { \
++        state = nextState; \
++        break; \
++    }
++
++    uint64_t accumulator = 0;
++    for (unsigned index = 0; index < str.length(); ++index) {
++        const int ch = str[index];
++        switch (state) {
++        case StateDigit:
++            if (ch >= '0' && ch <= '9') {
++                if (numberOfDigits < Precision) {
++                    ++numberOfDigits;
++                    accumulator *= 10;
++                    accumulator += ch - '0';
++                } else {
++                    ++numberOfExtraDigits;
++                }
++                break;
++            }
++
++            HandleCharAndBreak('.', StateDot);
++            HandleTwoCharsAndBreak('E', 'e', StateE);
++            return nan();
++
++        case StateDot:
++        case StateDotDigit:
++            if (ch >= '0' && ch <= '9') {
++                if (numberOfDigits < Precision) {
++                    ++numberOfDigits;
++                    ++numberOfDigitsAfterDot;
++                    accumulator *= 10;
++                    accumulator += ch - '0';
++                }
++                state = StateDotDigit;
++                break;
++            }
++
++            HandleTwoCharsAndBreak('E', 'e', StateE);
++            return nan();
++
++        case StateE:
++            if (ch == '+') {
++                exponentSign = Positive;
++                state = StateESign;
++                break;
++            }
++
++            if (ch == '-') {
++                exponentSign = Negative;
++                state = StateESign;
++                break;
++            }
++
++            if (ch >= '0' && ch <= '9') {
++                exponent = ch - '0';
++                state = StateEDigit;
++                break;
++            }
++
++            return nan();
++
++        case StateEDigit:
++            if (ch >= '0' && ch <= '9') {
++                exponent *= 10;
++                exponent += ch - '0';
++                if (exponent > ExponentMax + Precision) {
++                    if (accumulator)
++                        return exponentSign == Negative ? zero(Positive) : infinity(sign);
++                    return zero(sign);
++                }
++                state = StateEDigit;
++                break;
++            }
++
++            return nan();
++
++        case StateESign:
++            if (ch >= '0' && ch <= '9') {
++                exponent = ch - '0';
++                state = StateEDigit;
++                break;
++            }
++
++            return nan();
++
++        case StateSign:
++            if (ch >= '1' && ch <= '9') {
++                accumulator = ch - '0';
++                numberOfDigits = 1;
++                state = StateDigit;
++                break;
++            }
++
++            HandleCharAndBreak('0', StateZero);
++            return nan();
++
++        case StateStart:
++            if (ch >= '1' && ch <= '9') {
++                accumulator = ch - '0';
++                numberOfDigits = 1;
++                state = StateDigit;
++                break;
++            }
++
++            if (ch == '-') {
++                sign = Negative;
++                state = StateSign;
++                break;
++            }
++
++            if (ch == '+') {
++                sign = Positive;
++                state = StateSign;
++                break;
++            }
++
++            HandleCharAndBreak('0', StateZero);
++            HandleCharAndBreak('.', StateDot);
++            return nan();
++
++        case StateZero:
++            if (ch == '0')
++                break;
++
++            if (ch >= '1' && ch <= '9') {
++                accumulator = ch - '0';
++                numberOfDigits = 1;
++                state = StateDigit;
++                break;
++            }
++
++            HandleCharAndBreak('.', StateDot);
++            HandleTwoCharsAndBreak('E', 'e', StateE);
++            return nan();
++
++        default:
++            ASSERT_NOT_REACHED();
++            return nan();
++        }
++    }
++
++    if (state == StateZero)
++        return zero(sign);
++
++    if (state == StateDigit || state == StateEDigit || state == StateDotDigit) {
++        int resultExponent = exponent * (exponentSign == Negative ? -1 : 1) - numberOfDigitsAfterDot + numberOfExtraDigits;
++        if (resultExponent < ExponentMin)
++            return zero(Positive);
++
++        const int overflow = resultExponent - ExponentMax + 1;
++        if (overflow > 0) {
++            if (overflow + numberOfDigits - numberOfDigitsAfterDot > Precision)
++                return infinity(sign);
++            accumulator = scaleUp(accumulator, overflow);
++            resultExponent -= overflow;
++        }
++
++        return Decimal(sign, resultExponent, accumulator);
++    }
++
++    return nan();
++}
++
++Decimal Decimal::infinity(const Sign sign)
++{
++    return Decimal(EncodedData(sign, EncodedData::ClassInfinity));
++}
++
++Decimal Decimal::nan()
++{
++    return Decimal(EncodedData(Positive, EncodedData::ClassNaN));
++}
++
++Decimal Decimal::remainder(const Decimal& rhs) const
++{
++    const Decimal quotient = *this / rhs;
++    return quotient.isSpecial() ? quotient : *this - (quotient.isNegative() ? quotient.ceiling() : quotient.floor()) * rhs;
++}
++
++Decimal Decimal::round() const
++{
++    if (isSpecial())
++        return *this;
++
++    if (exponent() >= 0)
++        return *this;
++
++    uint64_t result = m_data.coefficient();
++    const int numberOfDigits = countDigits(result);
++    const int numberOfDropDigits = -exponent();
++    if (numberOfDigits < numberOfDropDigits)
++        return zero(Positive);
++
++    result = scaleDown(result, numberOfDropDigits - 1);
++    if (result % 10 >= 5)
++        result += 10;
++    result /= 10;
++    return Decimal(sign(), 0, result);
++}
++
++double Decimal::toDouble() const
++{
++    if (isFinite()) {
++        bool valid;
++        const double doubleValue = toString().toDouble(&valid);
++        return valid ? doubleValue : std::numeric_limits<double>::quiet_NaN();
++    }
++
++    if (isInfinity())
++        return isNegative() ? -std::numeric_limits<double>::infinity() : std::numeric_limits<double>::infinity();
++
++    return std::numeric_limits<double>::quiet_NaN();
++}
++
++String Decimal::toString() const
++{
++    switch (m_data.formatClass()) {
++    case EncodedData::ClassInfinity:
++        return sign() ? "-Infinity" : "Infinity";
++
++    case EncodedData::ClassNaN:
++        return "NaN";
++
++    case EncodedData::ClassNormal:
++    case EncodedData::ClassZero:
++        break;
++
++    default:
++        ASSERT_NOT_REACHED();
++        return "";
++    }
++
++    StringBuilder builder;
++    if (sign())
++        builder.append('-');
++
++    int originalExponent = exponent();
++    uint64_t coefficient = m_data.coefficient();
++
++    if (originalExponent < 0) {
++        const int maxDigits = DBL_DIG;
++        uint64_t lastDigit = 0;
++        while (countDigits(coefficient) > maxDigits) {
++            lastDigit = coefficient % 10;
++            coefficient /= 10;
++            ++originalExponent;
++        }
++
++        if (lastDigit >= 5)
++            ++coefficient;
++
++        while (originalExponent < 0 && coefficient && !(coefficient % 10)) {
++            coefficient /= 10;
++            ++originalExponent;
++        }
++    }
++
++    const String digits = String::number(coefficient);
++    int coefficientLength = static_cast<int>(digits.length());
++    const int adjustedExponent = originalExponent + coefficientLength - 1;
++    if (originalExponent <= 0 && adjustedExponent >= -6) {
++        if (!originalExponent) {
++            builder.append(digits);
++            return builder.toString();
++        }
++
++        if (adjustedExponent >= 0) {
++            for (int i = 0; i < coefficientLength; ++i) {
++                builder.append(digits[i]);
++                if (i == adjustedExponent)
++                    builder.append('.');
++            }
++            return builder.toString();
++        }
++
++        builder.appendLiteral("0.");
++        for (int i = adjustedExponent + 1; i < 0; ++i)
++            builder.append('0');
++
++        builder.append(digits);
++
++    } else {
++        builder.append(digits[0]);
++        while (coefficientLength >= 2 && digits[coefficientLength - 1] == '0')
++            --coefficientLength;
++        if (coefficientLength >= 2) {
++            builder.append('.');
++            for (int i = 1; i < coefficientLength; ++i)
++                builder.append(digits[i]);
++        }
++
++        if (adjustedExponent) {
++            builder.append(adjustedExponent < 0 ? "e" : "e+");
++            builder.appendNumber(adjustedExponent);
++        }
++    }
++    return builder.toString();
++}
++
++Decimal Decimal::zero(Sign sign)
++{
++    return Decimal(EncodedData(sign, EncodedData::ClassZero));
++}
++
++} // namespace blink
+diff --git a/Source/platform/Decimal.h b/Source/platform/Decimal.h
+new file mode 100644
+index 0000000..874a8b6
+--- /dev/null
++++ b/Source/platform/Decimal.h
+@@ -0,0 +1,182 @@
++/*
++ * Copyright (C) 2012 Google Inc. All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions are
++ * met:
++ *
++ *     * Redistributions of source code must retain the above copyright
++ * notice, this list of conditions and the following disclaimer.
++ *     * Redistributions in binary form must reproduce the above
++ * copyright notice, this list of conditions and the following disclaimer
++ * in the documentation and/or other materials provided with the
++ * distribution.
++ *     * Neither the name of Google Inc. nor the names of its
++ * contributors may be used to endorse or promote products derived from
++ * this software without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++ * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++ * OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++ * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ */
++
++#ifndef Decimal_h
++#define Decimal_h
++
++#include "platform/PlatformExport.h"
++#include "wtf/Assertions.h"
++#include "wtf/text/WTFString.h"
++#include <stdint.h>
++
++namespace blink {
++
++namespace DecimalPrivate {
++class SpecialValueHandler;
++}
++
++// This class represents decimal base floating point number.
++//
++// FIXME: Once all C++ compiler support decimal type, we should replace this
++// class to compiler supported one. See below URI for current status of decimal
++// type for C++: // http://www.open-std.org/jtc1/sc22/wg21/docs/papers/2006/n1977.html
++class PLATFORM_EXPORT Decimal {
++    WTF_MAKE_FAST_ALLOCATED;
++public:
++    enum Sign {
++        Positive,
++        Negative,
++    };
++
++    // You should not use EncodedData other than unit testing.
++    class EncodedData {
++        // For accessing FormatClass.
++        friend class Decimal;
++        friend class DecimalPrivate::SpecialValueHandler;
++    public:
++        EncodedData(Sign, int exponent, uint64_t coefficient);
++
++        bool operator==(const EncodedData&) const;
++        bool operator!=(const EncodedData& another) const { return !operator==(another); }
++
++        uint64_t coefficient() const { return m_coefficient; }
++        int countDigits() const;
++        int exponent() const { return m_exponent; }
++        bool isFinite() const { return !isSpecial(); }
++        bool isInfinity() const { return m_formatClass == ClassInfinity; }
++        bool isNaN() const { return m_formatClass == ClassNaN; }
++        bool isSpecial() const { return m_formatClass == ClassInfinity || m_formatClass == ClassNaN; }
++        bool isZero() const { return m_formatClass == ClassZero; }
++        Sign sign() const { return m_sign; }
++        void setSign(Sign sign) { m_sign = sign; }
++
++    private:
++        enum FormatClass {
++            ClassInfinity,
++            ClassNormal,
++            ClassNaN,
++            ClassZero,
++        };
++
++        EncodedData(Sign, FormatClass);
++        FormatClass formatClass() const { return m_formatClass; }
++
++        uint64_t m_coefficient;
++        int16_t m_exponent;
++        FormatClass m_formatClass;
++        Sign m_sign;
++    };
++
++    Decimal(int32_t = 0);
++    Decimal(Sign, int exponent, uint64_t coefficient);
++    Decimal(const Decimal&);
++
++    Decimal& operator=(const Decimal&);
++    Decimal& operator+=(const Decimal&);
++    Decimal& operator-=(const Decimal&);
++    Decimal& operator*=(const Decimal&);
++    Decimal& operator/=(const Decimal&);
++
++    Decimal operator-() const;
++
++    bool operator==(const Decimal&) const;
++    bool operator!=(const Decimal&) const;
++    bool operator<(const Decimal&) const;
++    bool operator<=(const Decimal&) const;
++    bool operator>(const Decimal&) const;
++    bool operator>=(const Decimal&) const;
++
++    Decimal operator+(const Decimal&) const;
++    Decimal operator-(const Decimal&) const;
++    Decimal operator*(const Decimal&) const;
++    Decimal operator/(const Decimal&) const;
++
++    int exponent() const
++    {
++        ASSERT(isFinite());
++        return m_data.exponent();
++    }
++
++    bool isFinite() const { return m_data.isFinite(); }
++    bool isInfinity() const { return m_data.isInfinity(); }
++    bool isNaN() const { return m_data.isNaN(); }
++    bool isNegative() const { return sign() == Negative; }
++    bool isPositive() const { return sign() == Positive; }
++    bool isSpecial() const { return m_data.isSpecial(); }
++    bool isZero() const { return m_data.isZero(); }
++
++    Decimal abs() const;
++    Decimal ceiling() const;
++    Decimal floor() const;
++    Decimal remainder(const Decimal&) const;
++    Decimal round() const;
++
++    double toDouble() const;
++    // Note: toString method supports infinity and nan but fromString not.
++    String toString() const;
++
++    static Decimal fromDouble(double);
++    // fromString supports following syntax EBNF:
++    //  number ::= sign? digit+ ('.' digit*) (exponent-marker sign? digit+)?
++    //          | sign? '.' digit+ (exponent-marker sign? digit+)?
++    //  sign ::= '+' | '-'
++    //  exponent-marker ::= 'e' | 'E'
++    //  digit ::= '0' | '1' | ... | '9'
++    // Note: fromString doesn't support "infinity" and "nan".
++    static Decimal fromString(const String&);
++    static Decimal infinity(Sign);
++    static Decimal nan();
++    static Decimal zero(Sign);
++
++    // You should not use below methods. We expose them for unit testing.
++    explicit Decimal(const EncodedData&);
++    const EncodedData& value() const { return m_data; }
++
++private:
++    struct AlignedOperands {
++        uint64_t lhsCoefficient;
++        uint64_t rhsCoefficient;
++        int exponent;
++    };
++
++    Decimal(double);
++    Decimal compareTo(const Decimal&) const;
++
++    static AlignedOperands alignOperands(const Decimal& lhs, const Decimal& rhs);
++    static inline Sign invertSign(Sign sign) { return sign == Negative ? Positive : Negative; }
++
++    Sign sign() const { return m_data.sign(); }
++
++    EncodedData m_data;
++};
++
++} // namespace blink
++
++#endif // Decimal_h
+diff --git a/Source/platform/JSONValues.cpp b/Source/platform/JSONValues.cpp
+new file mode 100644
+index 0000000..cd71089
+--- /dev/null
++++ b/Source/platform/JSONValues.cpp
+@@ -0,0 +1,529 @@
++/*
++ * Copyright (C) 2010 Google Inc. All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions are
++ * met:
++ *
++ *     * Redistributions of source code must retain the above copyright
++ * notice, this list of conditions and the following disclaimer.
++ *     * Redistributions in binary form must reproduce the above
++ * copyright notice, this list of conditions and the following disclaimer
++ * in the documentation and/or other materials provided with the
++ * distribution.
++ *     * Neither the name of Google Inc. nor the names of its
++ * contributors may be used to endorse or promote products derived from
++ * this software without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++ * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++ * OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++ * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ */
++
++#include "config.h"
++#include "platform/JSONValues.h"
++
++#include "platform/Decimal.h"
++#include "wtf/MathExtras.h"
++#include "wtf/text/StringBuilder.h"
++
++namespace blink {
++
++namespace {
++
++const char* const nullString = "null";
++const char* const trueString = "true";
++const char* const falseString = "false";
++
++inline bool escapeChar(UChar c, StringBuilder* dst)
++{
++    switch (c) {
++    case '\b': dst->appendLiteral("\\b"); break;
++    case '\f': dst->appendLiteral("\\f"); break;
++    case '\n': dst->appendLiteral("\\n"); break;
++    case '\r': dst->appendLiteral("\\r"); break;
++    case '\t': dst->appendLiteral("\\t"); break;
++    case '\\': dst->appendLiteral("\\\\"); break;
++    case '"': dst->appendLiteral("\\\""); break;
++    default:
++        return false;
++    }
++    return true;
++}
++
++inline void doubleQuoteString(const String& str, StringBuilder* dst)
++{
++    dst->append('"');
++    for (unsigned i = 0; i < str.length(); ++i) {
++        UChar c = str[i];
++        if (!escapeChar(c, dst)) {
++            if (c < 32 || c > 126 || c == '<' || c == '>') {
++                // 1. Escaping <, > to prevent script execution.
++                // 2. Technically, we could also pass through c > 126 as UTF8, but this
++                //    is also optional. It would also be a pain to implement here.
++                unsigned symbol = static_cast<unsigned>(c);
++                String symbolCode = String::format("\\u%04X", symbol);
++                dst->append(symbolCode);
++            } else {
++                dst->append(c);
++            }
++        }
++    }
++    dst->append('"');
++}
++
++void writeIndent(int depth, StringBuilder* output)
++{
++    for (int i = 0; i < depth; ++i)
++        output->appendLiteral("  ");
++}
++
++} // anonymous namespace
++
++bool JSONValue::asBoolean(bool*) const
++{
++    return false;
++}
++
++bool JSONValue::asNumber(double*) const
++{
++    return false;
++}
++
++bool JSONValue::asNumber(long*) const
++{
++    return false;
++}
++
++bool JSONValue::asNumber(int*) const
++{
++    return false;
++}
++
++bool JSONValue::asNumber(unsigned long*) const
++{
++    return false;
++}
++
++bool JSONValue::asNumber(unsigned*) const
++{
++    return false;
++}
++
++bool JSONValue::asString(String*) const
++{
++    return false;
++}
++
++bool JSONValue::asValue(RefPtr<JSONValue>* output)
++{
++    *output = this;
++    return true;
++}
++
++bool JSONValue::asObject(RefPtr<JSONObject>*)
++{
++    return false;
++}
++
++bool JSONValue::asArray(RefPtr<JSONArray>*)
++{
++    return false;
++}
++
++PassRefPtr<JSONObject> JSONValue::asObject()
++{
++    return nullptr;
++}
++
++PassRefPtr<JSONArray> JSONValue::asArray()
++{
++    return nullptr;
++}
++
++String JSONValue::toJSONString() const
++{
++    StringBuilder result;
++    result.reserveCapacity(512);
++    writeJSON(&result);
++    return result.toString();
++}
++
++String JSONValue::toPrettyJSONString() const
++{
++    StringBuilder result;
++    result.reserveCapacity(512);
++    prettyWriteJSON(&result);
++    return result.toString();
++}
++
++void JSONValue::writeJSON(StringBuilder* output) const
++{
++    ASSERT(m_type == TypeNull);
++    output->append(nullString, 4);
++}
++
++void JSONValue::prettyWriteJSON(StringBuilder* output) const
++{
++    prettyWriteJSONInternal(output, 0);
++    output->append('\n');
++}
++
++void JSONValue::prettyWriteJSONInternal(StringBuilder* output, int depth) const
++{
++    writeJSON(output);
++}
++
++bool JSONBasicValue::asBoolean(bool* output) const
++{
++    if (type() != TypeBoolean)
++        return false;
++    *output = m_boolValue;
++    return true;
++}
++
++bool JSONBasicValue::asNumber(double* output) const
++{
++    if (type() != TypeNumber)
++        return false;
++    *output = m_doubleValue;
++    return true;
++}
++
++bool JSONBasicValue::asNumber(long* output) const
++{
++    if (type() != TypeNumber)
++        return false;
++    *output = static_cast<long>(m_doubleValue);
++    return true;
++}
++
++bool JSONBasicValue::asNumber(int* output) const
++{
++    if (type() != TypeNumber)
++        return false;
++    *output = static_cast<int>(m_doubleValue);
++    return true;
++}
++
++bool JSONBasicValue::asNumber(unsigned long* output) const
++{
++    if (type() != TypeNumber)
++        return false;
++    *output = static_cast<unsigned long>(m_doubleValue);
++    return true;
++}
++
++bool JSONBasicValue::asNumber(unsigned* output) const
++{
++    if (type() != TypeNumber)
++        return false;
++    *output = static_cast<unsigned>(m_doubleValue);
++    return true;
++}
++
++void JSONBasicValue::writeJSON(StringBuilder* output) const
++{
++    ASSERT(type() == TypeBoolean || type() == TypeNumber);
++    if (type() == TypeBoolean) {
++        if (m_boolValue)
++            output->append(trueString, 4);
++        else
++            output->append(falseString, 5);
++    } else if (type() == TypeNumber) {
++        if (!std::isfinite(m_doubleValue)) {
++            output->append(nullString, 4);
++            return;
++        }
++        output->append(Decimal::fromDouble(m_doubleValue).toString());
++    }
++}
++
++bool JSONString::asString(String* output) const
++{
++    *output = m_stringValue;
++    return true;
++}
++
++void JSONString::writeJSON(StringBuilder* output) const
++{
++    ASSERT(type() == TypeString);
++    doubleQuoteString(m_stringValue, output);
++}
++
++JSONObjectBase::~JSONObjectBase()
++{
++}
++
++bool JSONObjectBase::asObject(RefPtr<JSONObject>* output)
++{
++    COMPILE_ASSERT(sizeof(JSONObject) == sizeof(JSONObjectBase), cannot_cast);
++    *output = static_cast<JSONObject*>(this);
++    return true;
++}
++
++PassRefPtr<JSONObject> JSONObjectBase::asObject()
++{
++    return openAccessors();
++}
++
++void JSONObjectBase::setBoolean(const String& name, bool value)
++{
++    setValue(name, JSONBasicValue::create(value));
++}
++
++void JSONObjectBase::setNumber(const String& name, double value)
++{
++    setValue(name, JSONBasicValue::create(value));
++}
++
++void JSONObjectBase::setString(const String& name, const String& value)
++{
++    setValue(name, JSONString::create(value));
++}
++
++void JSONObjectBase::setValue(const String& name, PassRefPtr<JSONValue> value)
++{
++    ASSERT(value);
++    if (m_data.set(name, value).isNewEntry)
++        m_order.append(name);
++}
++
++void JSONObjectBase::setObject(const String& name, PassRefPtr<JSONObject> value)
++{
++    ASSERT(value);
++    if (m_data.set(name, value).isNewEntry)
++        m_order.append(name);
++}
++
++void JSONObjectBase::setArray(const String& name, PassRefPtr<JSONArray> value)
++{
++    ASSERT(value);
++    if (m_data.set(name, value).isNewEntry)
++        m_order.append(name);
++}
++
++JSONObject* JSONObjectBase::openAccessors()
++{
++    COMPILE_ASSERT(sizeof(JSONObject) == sizeof(JSONObjectBase), cannot_cast);
++    return static_cast<JSONObject*>(this);
++}
++
++JSONObjectBase::iterator JSONObjectBase::find(const String& name)
++{
++    return m_data.find(name);
++}
++
++JSONObjectBase::const_iterator JSONObjectBase::find(const String& name) const
++{
++    return m_data.find(name);
++}
++
++bool JSONObjectBase::getBoolean(const String& name, bool* output) const
++{
++    RefPtr<JSONValue> value = get(name);
++    if (!value)
++        return false;
++    return value->asBoolean(output);
++}
++
++bool JSONObjectBase::getString(const String& name, String* output) const
++{
++    RefPtr<JSONValue> value = get(name);
++    if (!value)
++        return false;
++    return value->asString(output);
++}
++
++PassRefPtr<JSONObject> JSONObjectBase::getObject(const String& name) const
++{
++    RefPtr<JSONValue> value = get(name);
++    if (!value)
++        return nullptr;
++    return value->asObject();
++}
++
++PassRefPtr<JSONArray> JSONObjectBase::getArray(const String& name) const
++{
++    RefPtr<JSONValue> value = get(name);
++    if (!value)
++        return nullptr;
++    return value->asArray();
++}
++
++PassRefPtr<JSONValue> JSONObjectBase::get(const String& name) const
++{
++    Dictionary::const_iterator it = m_data.find(name);
++    if (it == m_data.end())
++        return nullptr;
++    return it->value;
++}
++
++void JSONObjectBase::remove(const String& name)
++{
++    m_data.remove(name);
++    for (size_t i = 0; i < m_order.size(); ++i) {
++        if (m_order[i] == name) {
++            m_order.remove(i);
++            break;
++        }
++    }
++}
++
++void JSONObjectBase::writeJSON(StringBuilder* output) const
++{
++    output->append('{');
++    for (size_t i = 0; i < m_order.size(); ++i) {
++        Dictionary::const_iterator it = m_data.find(m_order[i]);
++        ASSERT_WITH_SECURITY_IMPLICATION(it != m_data.end());
++        if (i)
++            output->append(',');
++        doubleQuoteString(it->key, output);
++        output->append(':');
++        it->value->writeJSON(output);
++    }
++    output->append('}');
++}
++
++void JSONObjectBase::prettyWriteJSONInternal(StringBuilder* output, int depth) const
++{
++    output->appendLiteral("{\n");
++    for (size_t i = 0; i < m_order.size(); ++i) {
++        Dictionary::const_iterator it = m_data.find(m_order[i]);
++        ASSERT_WITH_SECURITY_IMPLICATION(it != m_data.end());
++        if (i)
++            output->appendLiteral(",\n");
++        writeIndent(depth + 1, output);
++        doubleQuoteString(it->key, output);
++        output->appendLiteral(": ");
++        it->value->prettyWriteJSONInternal(output, depth + 1);
++    }
++    output->append('\n');
++    writeIndent(depth, output);
++    output->append('}');
++}
++
++JSONObjectBase::JSONObjectBase()
++    : JSONValue(TypeObject)
++    , m_data()
++    , m_order()
++{
++}
++
++JSONArrayBase::~JSONArrayBase()
++{
++}
++
++bool JSONArrayBase::asArray(RefPtr<JSONArray>* output)
++{
++    COMPILE_ASSERT(sizeof(JSONArrayBase) == sizeof(JSONArray), cannot_cast);
++    *output = static_cast<JSONArray*>(this);
++    return true;
++}
++
++PassRefPtr<JSONArray> JSONArrayBase::asArray()
++{
++    COMPILE_ASSERT(sizeof(JSONArrayBase) == sizeof(JSONArray), cannot_cast);
++    return static_cast<JSONArray*>(this);
++}
++
++void JSONArrayBase::writeJSON(StringBuilder* output) const
++{
++    output->append('[');
++    for (Vector<RefPtr<JSONValue> >::const_iterator it = m_data.begin(); it != m_data.end(); ++it) {
++        if (it != m_data.begin())
++            output->append(',');
++        (*it)->writeJSON(output);
++    }
++    output->append(']');
++}
++
++void JSONArrayBase::prettyWriteJSONInternal(StringBuilder* output, int depth) const
++{
++    output->append('[');
++    bool lastIsArrayOrObject = false;
++    for (Vector<RefPtr<JSONValue> >::const_iterator it = m_data.begin(); it != m_data.end(); ++it) {
++        bool isArrayOrObject = (*it)->type() == JSONValue::TypeObject || (*it)->type() == JSONValue::TypeArray;
++        if (it == m_data.begin()) {
++            if (isArrayOrObject) {
++                output->append('\n');
++                writeIndent(depth + 1, output);
++            }
++        } else {
++            output->append(',');
++            if (lastIsArrayOrObject) {
++                output->append('\n');
++                writeIndent(depth + 1, output);
++            } else {
++                output->append(' ');
++            }
++        }
++        (*it)->prettyWriteJSONInternal(output, depth + 1);
++        lastIsArrayOrObject = isArrayOrObject;
++    }
++    if (lastIsArrayOrObject) {
++        output->append('\n');
++        writeIndent(depth, output);
++    }
++    output->append(']');
++}
++
++JSONArrayBase::JSONArrayBase()
++    : JSONValue(TypeArray)
++    , m_data()
++{
++}
++
++void JSONArrayBase::pushBoolean(bool value)
++{
++    m_data.append(JSONBasicValue::create(value));
++}
++
++void JSONArrayBase::pushInt(int value)
++{
++    m_data.append(JSONBasicValue::create(value));
++}
++
++void JSONArrayBase::pushNumber(double value)
++{
++    m_data.append(JSONBasicValue::create(value));
++}
++
++void JSONArrayBase::pushString(const String& value)
++{
++    m_data.append(JSONString::create(value));
++}
++
++void JSONArrayBase::pushValue(PassRefPtr<JSONValue> value)
++{
++    ASSERT(value);
++    m_data.append(value);
++}
++
++void JSONArrayBase::pushObject(PassRefPtr<JSONObject> value)
++{
++    ASSERT(value);
++    m_data.append(value);
++}
++
++void JSONArrayBase::pushArray(PassRefPtr<JSONArray> value)
++{
++    ASSERT(value);
++    m_data.append(value);
++}
++
++PassRefPtr<JSONValue> JSONArrayBase::get(size_t index)
++{
++    ASSERT_WITH_SECURITY_IMPLICATION(index < m_data.size());
++    return m_data[index];
++}
++
++} // namespace blink
+diff --git a/Source/platform/JSONValues.h b/Source/platform/JSONValues.h
+new file mode 100644
+index 0000000..b8ba0c4
+--- /dev/null
++++ b/Source/platform/JSONValues.h
+@@ -0,0 +1,319 @@
++/*
++ * Copyright (C) 2009 Google Inc. All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions are
++ * met:
++ *
++ *     * Redistributions of source code must retain the above copyright
++ * notice, this list of conditions and the following disclaimer.
++ *     * Redistributions in binary form must reproduce the above
++ * copyright notice, this list of conditions and the following disclaimer
++ * in the documentation and/or other materials provided with the
++ * distribution.
++ *     * Neither the name of Google Inc. nor the names of its
++ * contributors may be used to endorse or promote products derived from
++ * this software without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++ * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++ * OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++ * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ */
++
++#ifndef JSONValues_h
++#define JSONValues_h
++
++#include "platform/PlatformExport.h"
++#include "wtf/Forward.h"
++#include "wtf/HashMap.h"
++#include "wtf/RefCounted.h"
++#include "wtf/Vector.h"
++#include "wtf/text/StringHash.h"
++#include "wtf/text/WTFString.h"
++
++namespace blink {
++
++class JSONArray;
++class JSONObject;
++
++class PLATFORM_EXPORT JSONValue : public RefCounted<JSONValue> {
++public:
++    static const int maxDepth = 1000;
++
++    JSONValue() : m_type(TypeNull) { }
++    virtual ~JSONValue() { }
++
++    static PassRefPtr<JSONValue> null()
++    {
++        return adoptRef(new JSONValue());
++    }
++
++    typedef enum {
++        TypeNull = 0,
++        TypeBoolean,
++        TypeNumber,
++        TypeString,
++        TypeObject,
++        TypeArray
++    } Type;
++
++    Type type() const { return m_type; }
++
++    bool isNull() const { return m_type == TypeNull; }
++
++    virtual bool asBoolean(bool* output) const;
++    virtual bool asNumber(double* output) const;
++    virtual bool asNumber(long* output) const;
++    virtual bool asNumber(int* output) const;
++    virtual bool asNumber(unsigned long* output) const;
++    virtual bool asNumber(unsigned* output) const;
++    virtual bool asString(String* output) const;
++    virtual bool asValue(RefPtr<JSONValue>* output);
++    virtual bool asObject(RefPtr<JSONObject>* output);
++    virtual bool asArray(RefPtr<JSONArray>* output);
++    virtual PassRefPtr<JSONObject> asObject();
++    virtual PassRefPtr<JSONArray> asArray();
++
++    String toJSONString() const;
++    String toPrettyJSONString() const;
++    virtual void writeJSON(StringBuilder* output) const;
++    virtual void prettyWriteJSON(StringBuilder* output) const;
++
++protected:
++    explicit JSONValue(Type type) : m_type(type) { }
++    virtual void prettyWriteJSONInternal(StringBuilder* output, int depth) const;
++
++private:
++    friend class JSONObjectBase;
++    friend class JSONArrayBase;
++
++    Type m_type;
++};
++
++class PLATFORM_EXPORT JSONBasicValue : public JSONValue {
++public:
++
++    static PassRefPtr<JSONBasicValue> create(bool value)
++    {
++        return adoptRef(new JSONBasicValue(value));
++    }
++
++    static PassRefPtr<JSONBasicValue> create(int value)
++    {
++        return adoptRef(new JSONBasicValue(value));
++    }
++
++    static PassRefPtr<JSONBasicValue> create(double value)
++    {
++        return adoptRef(new JSONBasicValue(value));
++    }
++
++    virtual bool asBoolean(bool* output) const OVERRIDE;
++    virtual bool asNumber(double* output) const OVERRIDE;
++    virtual bool asNumber(long* output) const OVERRIDE;
++    virtual bool asNumber(int* output) const OVERRIDE;
++    virtual bool asNumber(unsigned long* output) const OVERRIDE;
++    virtual bool asNumber(unsigned* output) const OVERRIDE;
++
++    virtual void writeJSON(StringBuilder* output) const OVERRIDE;
++
++private:
++    explicit JSONBasicValue(bool value) : JSONValue(TypeBoolean), m_boolValue(value) { }
++    explicit JSONBasicValue(int value) : JSONValue(TypeNumber), m_doubleValue((double)value) { }
++    explicit JSONBasicValue(double value) : JSONValue(TypeNumber), m_doubleValue(value) { }
++
++    union {
++        bool m_boolValue;
++        double m_doubleValue;
++    };
++};
++
++class PLATFORM_EXPORT JSONString : public JSONValue {
++public:
++    static PassRefPtr<JSONString> create(const String& value)
++    {
++        return adoptRef(new JSONString(value));
++    }
++
++    static PassRefPtr<JSONString> create(const char* value)
++    {
++        return adoptRef(new JSONString(value));
++    }
++
++    virtual bool asString(String* output) const OVERRIDE;
++
++    virtual void writeJSON(StringBuilder* output) const OVERRIDE;
++
++private:
++    explicit JSONString(const String& value) : JSONValue(TypeString), m_stringValue(value) { }
++    explicit JSONString(const char* value) : JSONValue(TypeString), m_stringValue(value) { }
++
++    String m_stringValue;
++};
++
++class PLATFORM_EXPORT JSONObjectBase : public JSONValue {
++private:
++    typedef HashMap<String, RefPtr<JSONValue> > Dictionary;
++
++public:
++    typedef Dictionary::iterator iterator;
++    typedef Dictionary::const_iterator const_iterator;
++
++    virtual PassRefPtr<JSONObject> asObject() OVERRIDE;
++    JSONObject* openAccessors();
++
++    virtual void writeJSON(StringBuilder* output) const OVERRIDE;
++
++protected:
++    virtual ~JSONObjectBase();
++
++    virtual bool asObject(RefPtr<JSONObject>* output) OVERRIDE;
++
++    void setBoolean(const String& name, bool);
++    void setNumber(const String& name, double);
++    void setString(const String& name, const String&);
++    void setValue(const String& name, PassRefPtr<JSONValue>);
++    void setObject(const String& name, PassRefPtr<JSONObject>);
++    void setArray(const String& name, PassRefPtr<JSONArray>);
++
++    iterator find(const String& name);
++    const_iterator find(const String& name) const;
++    bool getBoolean(const String& name, bool* output) const;
++    template<class T> bool getNumber(const String& name, T* output) const
++    {
++        RefPtr<JSONValue> value = get(name);
++        if (!value)
++            return false;
++        return value->asNumber(output);
++    }
++    bool getString(const String& name, String* output) const;
++    PassRefPtr<JSONObject> getObject(const String& name) const;
++    PassRefPtr<JSONArray> getArray(const String& name) const;
++    PassRefPtr<JSONValue> get(const String& name) const;
++
++    void remove(const String& name);
++
++    virtual void prettyWriteJSONInternal(StringBuilder* output, int depth) const OVERRIDE;
++
++    iterator begin() { return m_data.begin(); }
++    iterator end() { return m_data.end(); }
++    const_iterator begin() const { return m_data.begin(); }
++    const_iterator end() const { return m_data.end(); }
++
++    int size() const { return m_data.size(); }
++
++protected:
++    JSONObjectBase();
++
++private:
++    Dictionary m_data;
++    Vector<String> m_order;
++};
++
++class PLATFORM_EXPORT JSONObject : public JSONObjectBase {
++public:
++    static PassRefPtr<JSONObject> create()
++    {
++        return adoptRef(new JSONObject());
++    }
++
++    using JSONObjectBase::asObject;
++
++    using JSONObjectBase::setBoolean;
++    using JSONObjectBase::setNumber;
++    using JSONObjectBase::setString;
++    using JSONObjectBase::setValue;
++    using JSONObjectBase::setObject;
++    using JSONObjectBase::setArray;
++
++    using JSONObjectBase::find;
++    using JSONObjectBase::getBoolean;
++    using JSONObjectBase::getNumber;
++    using JSONObjectBase::getString;
++    using JSONObjectBase::getObject;
++    using JSONObjectBase::getArray;
++    using JSONObjectBase::get;
++
++    using JSONObjectBase::remove;
++
++    using JSONObjectBase::begin;
++    using JSONObjectBase::end;
++
++    using JSONObjectBase::size;
++};
++
++
++class PLATFORM_EXPORT JSONArrayBase : public JSONValue {
++public:
++    typedef Vector<RefPtr<JSONValue> >::iterator iterator;
++    typedef Vector<RefPtr<JSONValue> >::const_iterator const_iterator;
++
++    virtual PassRefPtr<JSONArray> asArray() OVERRIDE;
++
++    unsigned length() const { return m_data.size(); }
++
++    virtual void writeJSON(StringBuilder* output) const OVERRIDE;
++
++protected:
++    virtual ~JSONArrayBase();
++
++    virtual bool asArray(RefPtr<JSONArray>* output) OVERRIDE;
++
++    void pushBoolean(bool);
++    void pushInt(int);
++    void pushNumber(double);
++    void pushString(const String&);
++    void pushValue(PassRefPtr<JSONValue>);
++    void pushObject(PassRefPtr<JSONObject>);
++    void pushArray(PassRefPtr<JSONArray>);
++
++    PassRefPtr<JSONValue> get(size_t index);
++
++    virtual void prettyWriteJSONInternal(StringBuilder* output, int depth) const OVERRIDE;
++
++    iterator begin() { return m_data.begin(); }
++    iterator end() { return m_data.end(); }
++    const_iterator begin() const { return m_data.begin(); }
++    const_iterator end() const { return m_data.end(); }
++
++protected:
++    JSONArrayBase();
++
++private:
++    Vector<RefPtr<JSONValue> > m_data;
++};
++
++class PLATFORM_EXPORT JSONArray : public JSONArrayBase {
++public:
++    static PassRefPtr<JSONArray> create()
++    {
++        return adoptRef(new JSONArray());
++    }
++
++    using JSONArrayBase::asArray;
++
++    using JSONArrayBase::pushBoolean;
++    using JSONArrayBase::pushInt;
++    using JSONArrayBase::pushNumber;
++    using JSONArrayBase::pushString;
++    using JSONArrayBase::pushValue;
++    using JSONArrayBase::pushObject;
++    using JSONArrayBase::pushArray;
++
++    using JSONArrayBase::get;
++
++    using JSONArrayBase::begin;
++    using JSONArrayBase::end;
++};
++
++} // namespace blink
++
++#endif // !defined(JSONValues_h)
+diff --git a/Source/platform/PlatformExport.h b/Source/platform/PlatformExport.h
+new file mode 100644
+index 0000000..8230fbb
+--- /dev/null
++++ b/Source/platform/PlatformExport.h
+@@ -0,0 +1,66 @@
++/*
++ * Copyright (C) 2013 Google Inc. All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions are
++ * met:
++ *
++ *     * Redistributions of source code must retain the above copyright
++ * notice, this list of conditions and the following disclaimer.
++ *     * Redistributions in binary form must reproduce the above
++ * copyright notice, this list of conditions and the following disclaimer
++ * in the documentation and/or other materials provided with the
++ * distribution.
++ *     * Neither the name of Google Inc. nor the names of its
++ * contributors may be used to endorse or promote products derived from
++ * this software without specific prior written permission.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++ * "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++ * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++ * A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++ * OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++ * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ */
++
++
++#ifndef PlatformExport_h
++#define PlatformExport_h
++
++#if !defined(BLINK_PLATFORM_IMPLEMENTATION)
++#define BLINK_PLATFORM_IMPLEMENTATION 0
++#endif
++
++#if defined(COMPONENT_BUILD)
++#if defined(WIN32)
++#if BLINK_PLATFORM_IMPLEMENTATION
++#define PLATFORM_EXPORT __declspec(dllexport)
++#else
++#define PLATFORM_EXPORT __declspec(dllimport)
++#endif
++#else // defined(WIN32)
++#define PLATFORM_EXPORT __attribute__((visibility("default")))
++#endif
++#else // defined(COMPONENT_BUILD)
++#define PLATFORM_EXPORT
++#endif
++
++#if defined(_MSC_VER)
++// MSVC Compiler warning C4275:
++// non dll-interface class 'Bar' used as base for dll-interface class 'Foo'.
++// Note that this is intended to be used only when no access to the base class'
++// static data is done through derived classes or inline methods. For more info,
++// see http://msdn.microsoft.com/en-us/library/3tdb471s(VS.80).aspx
++//
++// This pragma will allow exporting a class that inherits from a non-exported
++// base class, anywhere in the Blink platform component. This is only
++// a problem when using the MSVC compiler on Windows.
++#pragma warning(suppress:4275)
++#endif
++
++#endif // PlatformExport_h
+diff --git a/Source/platform/blink_platform.gyp b/Source/platform/blink_platform.gyp
+new file mode 100644
+index 0000000..e9137b7
+--- /dev/null
++++ b/Source/platform/blink_platform.gyp
+@@ -0,0 +1,69 @@
++#
++# Copyright (C) 2013 Google Inc. All rights reserved.
++#
++# Redistribution and use in source and binary forms, with or without
++# modification, are permitted provided that the following conditions are
++# met:
++#
++#     * Redistributions of source code must retain the above copyright
++# notice, this list of conditions and the following disclaimer.
++#     * Redistributions in binary form must reproduce the above
++# copyright notice, this list of conditions and the following disclaimer
++# in the documentation and/or other materials provided with the
++# distribution.
++#     * Neither the name of Google Inc. nor the names of its
++# contributors may be used to endorse or promote products derived from
++# this software without specific prior written permission.
++#
++# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
++# "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
++# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
++# A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
++# OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
++# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
++# LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
++# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++#
++{
++  'includes': [
++#    '../build/features.gypi',
++#    '../build/scripts/scripts.gypi',
++#    '../build/win/precompile.gypi',
++    'blink_platform.gypi',
++#   'heap/blink_heap.gypi',
++  ],
++  'targets': [
++  {
++    'target_name': 'blink_platform',
++    'type': '<(component)',
++    'dependencies': [
++      '../config.gyp:config',
++      '../wtf/wtf.gyp:wtf',
++      '<(DEPTH)/third_party/icu/icu.gyp:icui18n',
++      '<(DEPTH)/third_party/icu/icu.gyp:icuuc',
++    ],
++    'defines': [
++      'BLINK_PLATFORM_IMPLEMENTATION=1',
++      'INSIDE_BLINK',
++    ],
++    'include_dirs': [
++      '<(angle_path)/include',
++      '<(SHARED_INTERMEDIATE_DIR)/blink',
++    ],
++    'xcode_settings': {
++      # Some Mac-specific parts of WebKit won't compile without having this
++      # prefix header injected.
++      'GCC_PREFIX_HEADER': '<(DEPTH)/third_party/WebKit/Source/build/mac/Prefix.h',
++    },
++    'sources': [
++      '<@(platform_files)',
++    ],
++    # Disable c4267 warnings until we fix size_t to int truncations.
++    # Disable c4724 warnings which is generated in VS2012 due to improper
++    # compiler optimizations, see crbug.com/237063
++    'msvs_disabled_warnings': [ 4267, 4334, 4724 ],
++  }],
++}
+diff --git a/Source/platform/blink_platform.gypi b/Source/platform/blink_platform.gypi
+new file mode 100644
+index 0000000..c3c2352
+--- /dev/null
++++ b/Source/platform/blink_platform.gypi
+@@ -0,0 +1,10 @@
++{
++  'variables': {
++    'platform_files': [
++      'Decimal.cpp',
++      'Decimal.h',
++      'JSONValues.cpp',
++      'JSONValues.h',
++    ]
++  },
++}
+-- 
+1.9.3 (Apple Git-50)
+
