@@ -1,7 +1,7 @@
 {
   'targets': [
     {
-      'target_name': 'All',
+      'target_name': 'all',
       'type': 'none',
       'dependencies': [
         'frontend_resources',
