@@ -7,19 +7,22 @@
 # This script is wrapper for Chromium that adds some support for how GYP
 # is invoked by Chromium beyond what can be done in the gclient hooks.
 
-import glob
-import gyp_environment
 import os
+import glob
 import re
 import shlex
 import subprocess
 import string
 import sys
-import vs_toolchain
 
 script_dir = os.path.dirname(os.path.realpath(__file__))
+build_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'build'))
 build_debugium = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'build_debugium'))
 chrome_src = os.path.abspath(os.path.join(script_dir, os.pardir))
+
+sys.path.insert(0, build_dir)
+import gyp_environment
+import vs_toolchain
 
 sys.path.insert(0, os.path.join(chrome_src, 'tools', 'gyp', 'pylib'))
 import gyp
@@ -28,39 +31,9 @@ import gyp
 SRC_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # Add paths so that pymod_do_main(...) can import files.
-sys.path.insert(1, os.path.join(chrome_src, 'build', 'android', 'gyp'))
-sys.path.insert(1, os.path.join(chrome_src, 'tools'))
-sys.path.insert(1, os.path.join(chrome_src, 'tools', 'generate_shim_headers'))
 sys.path.insert(1, os.path.join(chrome_src, 'tools', 'grit'))
-sys.path.insert(1, os.path.join(chrome_src, 'chrome', 'tools', 'build'))
-sys.path.insert(1, os.path.join(chrome_src, 'chromecast', 'tools', 'build'))
-sys.path.insert(1, os.path.join(chrome_src, 'native_client', 'build'))
-sys.path.insert(1, os.path.join(chrome_src, 'native_client_sdk', 'src',
-    'build_tools'))
-sys.path.insert(1, os.path.join(chrome_src, 'remoting', 'tools', 'build'))
-sys.path.insert(1, os.path.join(chrome_src, 'third_party', 'liblouis'))
-sys.path.insert(1, os.path.join(chrome_src, 'third_party', 'WebKit',
-    'Source', 'build', 'scripts'))
 
-# On Windows, Psyco shortens warm runs of build/gyp_chromium by about
-# 20 seconds on a z600 machine with 12 GB of RAM, from 90 down to 70
-# seconds.  Conversely, memory usage of build/gyp_chromium with Psyco
-# maxes out at about 158 MB vs. 132 MB without it.
-#
-# Psyco uses native libraries, so we need to load a different
-# installation depending on which OS we are running under. It has not
-# been tested whether using Psyco on our Mac and Linux builds is worth
-# it (the GYP running time is a lot shorter, so the JIT startup cost
-# may not be worth it).
-if sys.platform == 'win32':
-  try:
-    sys.path.insert(0, os.path.join(chrome_src, 'third_party', 'psyco_win32'))
-    import psyco
-  except:
-    psyco = None
-else:
-  psyco = None
-
+psyco = None
 
 def GetSupplementalFiles():
   """Returns a list of the supplemental files that are included in all GYP
@@ -180,7 +153,7 @@ def additional_include_files(supplemental_files, args=[]):
       result.append(path)
 
   # Always include common.gypi.
-  AddInclude(os.path.join(script_dir, 'common.gypi'))
+  AddInclude(os.path.join(build_dir, 'common.gypi'))
 
   # Optionally add supplemental .gypi files if present.
   for supplement in supplemental_files:
@@ -278,27 +251,6 @@ if __name__ == '__main__':
 
   supplemental_includes = GetSupplementalFiles()
   gyp_vars_dict = GetGypVars(supplemental_includes)
-
-  # TODO(dmikurube): Remove these checks and messages after a while.
-  if ('linux_use_tcmalloc' in gyp_vars_dict or
-      'android_use_tcmalloc' in gyp_vars_dict):
-    print '*****************************************************************'
-    print '"linux_use_tcmalloc" and "android_use_tcmalloc" are deprecated!'
-    print '-----------------------------------------------------------------'
-    print 'You specify "linux_use_tcmalloc" or "android_use_tcmalloc" in'
-    print 'your GYP_DEFINES. Please switch them into "use_allocator" now.'
-    print 'See http://crbug.com/345554 for the details.'
-    print '*****************************************************************'
-
-  # Automatically turn on crosscompile support for platforms that need it.
-  # (The Chrome OS build sets CC_host / CC_target which implicitly enables
-  # this mode.)
-  if all(('ninja' in os.environ.get('GYP_GENERATORS', ''),
-          gyp_vars_dict.get('OS') in ['android', 'ios'],
-          'GYP_CROSSCOMPILE' not in os.environ)):
-    os.environ['GYP_CROSSCOMPILE'] = '1'
-  if gyp_vars_dict.get('OS') == 'android':
-    args.append('--check')
 
   args.extend(
       ['-I' + i for i in additional_include_files(supplemental_includes, args)])

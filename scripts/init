@@ -29,11 +29,6 @@ git clone --depth 10 https://chromium.googlesource.com/chromium/src/tools/clang 
 # install ./src/third_party/llvm-build
 ./src/tools/clang/scripts/update.sh
 
-# copy the gyp_debugium script into the build dir in order to run it from there to make python imports work
-rm -f $SRC/build/gyp_debugium
-cp $SRC/build_debugium/gyp_debugium $SRC/build/gyp_debugium
-
-
 ## PATCHES
 ### WebKit
 (cd $SRC/third_party/WebKit/                                                                 \

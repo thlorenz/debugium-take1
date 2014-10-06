@@ -8,6 +8,13 @@
         'backend_resources',
         'backend'
       ],
+      'sources': [
+        '../src/debugium.cc'
+      ],
+      'include_dirs': [
+         '<!(node -e "require(\'nan\')")',
+        '../src'
+      ]
     }, # target: All
     {
       'target_name': 'frontend_resources',

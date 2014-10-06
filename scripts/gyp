@@ -5,4 +5,4 @@ DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 ROOT=$DIR/../
 SRC=$ROOT/src/
 
-$SRC/build/gyp_debugium
+$SRC/build_debugium/gyp_debugium
